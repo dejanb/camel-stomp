@@ -16,11 +16,9 @@
  */
 package org.apache.camel.component.stomp;
 
-import org.apache.camel.Consumer;
-import org.apache.camel.Message;
-import org.apache.camel.Processor;
-import org.apache.camel.Producer;
+import org.apache.camel.*;
 import org.apache.camel.impl.DefaultEndpoint;
+import org.fusesource.hawtbuf.AsciiBuffer;
 import org.fusesource.hawtdispatch.Dispatcher;
 import org.fusesource.hawtdispatch.Task;
 import org.fusesource.stomp.client.Callback;
@@ -32,6 +30,8 @@ import org.fusesource.stomp.codec.StompFrame;
 import static org.fusesource.hawtbuf.UTF8Buffer.utf8;
 import static org.fusesource.stomp.client.Constants.*;
 
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 public class StompEndpoint extends DefaultEndpoint {
@@ -39,6 +39,8 @@ public class StompEndpoint extends DefaultEndpoint {
     private CallbackConnection connection;
     private StompConfiguration configuration;
     private String destination;
+
+    private final List<StompConsumer> consumers = new CopyOnWriteArrayList<StompConsumer>();
 
     public StompEndpoint(String uri, StompComponent component, StompConfiguration configuration, String destination) {
         super(uri, component);
@@ -51,7 +53,7 @@ public class StompEndpoint extends DefaultEndpoint {
     }
 
     public Consumer createConsumer(Processor processor) throws Exception {
-        return null;
+        return new StompConsumer(this, processor);
     }
 
     public boolean isSingleton() {
@@ -65,6 +67,44 @@ public class StompEndpoint extends DefaultEndpoint {
         configuration.getStomp().connectCallback(promise);
 
         connection = promise.await();
+
+        connection.getDispatchQueue().execute(new Task() {
+            @Override
+            public void run() {
+                connection.receive(new Callback<StompFrame>() {
+                    @Override
+                    public void onFailure(Throwable value) {
+                        if (started.get()) {
+                            connection.close(null);
+                        }
+                    }
+
+                    @Override
+                    public void onSuccess(StompFrame value) {
+                        if (!consumers.isEmpty()) {
+                            Exchange exchange = createExchange();
+                            exchange.getIn().setBody(value.content());
+                            for (StompConsumer consumer : consumers) {
+                                consumer.processExchange(exchange);
+                            }
+                        }
+                    }
+                });
+                connection.resume();
+            }
+        });
+    }
+
+    @Override
+    protected void doStop() throws Exception {
+        connection.getDispatchQueue().execute(new Task() {
+            @Override
+            public void run() {
+                StompFrame frame = new StompFrame(DISCONNECT);
+                connection.send(frame, null);
+            }
+        });
+        connection.close(null);
     }
 
     protected void send(Message message) {
@@ -74,17 +114,7 @@ public class StompEndpoint extends DefaultEndpoint {
        connection.getDispatchQueue().execute(new Task() {
            @Override
            public void run() {
-               connection.send(frame, new Callback<Void>() {
-                   @Override
-                   public void onSuccess(Void value) {
-                       //System.out.println("sent");
-                   }
-
-                   @Override
-                   public void onFailure(Throwable value) {
-                       //System.out.println("failure " + value);
-                   }
-               });
+               connection.send(frame, null);
            }
        });
     }
@@ -92,5 +122,35 @@ public class StompEndpoint extends DefaultEndpoint {
     @Override
     protected String createEndpointUri() {
         return super.createEndpointUri();
+    }
+
+    void addConsumer(final StompConsumer consumer) {
+        connection.getDispatchQueue().execute(new Task() {
+            @Override
+            public void run() {
+                StompFrame frame = new StompFrame(SUBSCRIBE);
+                frame.addHeader(DESTINATION, StompFrame.encodeHeader(destination));
+                frame.addHeader(ID, consumer.id);
+                connection.send(frame, null);
+            }
+        });
+        consumers.add(consumer);
+    }
+
+    void removeConsumer(final StompConsumer consumer) {
+        connection.getDispatchQueue().execute(new Task() {
+            @Override
+            public void run() {
+                StompFrame frame = new StompFrame(UNSUBSCRIBE);
+                frame.addHeader(DESTINATION, StompFrame.encodeHeader(destination));
+                frame.addHeader(ID, consumer.id);
+                connection.send(frame, null);
+            }
+        });
+        consumers.remove(consumer);
+    }
+
+    AsciiBuffer getNextId() {
+        return connection.nextId();
     }
 }

@@ -29,7 +29,7 @@ public class StompBaseTest extends CamelTestSupport {
         brokerService = new BrokerService();
         brokerService.setPersistent(false);
         brokerService.setAdvisorySupport(false);
-        brokerService.addConnector("stomp://localhost:61613");
+        brokerService.addConnector("stomp://localhost:61613?trace=true");
         brokerService.start();
         brokerService.waitUntilStarted();
         super.setUp();
